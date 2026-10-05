@@ -713,18 +713,34 @@ async function enterRoom(code, key, initialView) {
   document.querySelector('.tab[data-tab="room"]').click();
 }
 
-// 服务端状态 -> 本地推算锚点（校时基准）
+// 服务端状态 -> 本地推算锚点（校时基准）：除服务端墙钟/时码外，同时记下本机单调时钟
+// 收到该状态的瞬间。之后两次同步之间一律按单调时钟的实际流逝推进，设备墙钟原有偏差
+// 或观看中被调整都不影响推算（单调时钟不随系统调表跳动）。
 function applyRoomAnchor(view) {
   state.room.anchor = {
     wall: view.server_wall,
     time: view.server_time,
     speed: view.speed,
     playing: view.playing,
+    mono: performance.now(),
   };
 }
 
+// 距最近一次同步实际流逝的秒数（本机单调时钟，与设备墙钟无关）
+function roomElapsedSec() {
+  const a = state.room && state.room.anchor;
+  return a ? Math.max(0, (performance.now() - a.mono) / 1000) : 0;
+}
+
+// 估算的服务端当前墙钟 = 最近同步的服务端墙钟 + 实际流逝；
+// 预约剩余时间、凭证剩余时间与预约时刻校验都以它为准，而非设备本地墙钟
+function roomServerNow() {
+  const a = state.room && state.room.anchor;
+  return a ? a.wall + roomElapsedSec() : Date.now() / 1000;
+}
+
 // 循环排演：把“线性目标时码”映射为编排中的真实演出时码（与服务端同一份纯函数）。
-// 观看端只拿到最近一次同步的段/轮/时码锚点；本地用墙钟外推。
+// 观看端只拿到最近一次同步的段/轮/时码锚点；本地按单调时钟的实际流逝外推。
 function roomProgramProjection(view, targetLinear) {
   const p = view.program;
   if (!p || p.finished) return { time: view.server_time, segIndex: p ? p.segment_index - 1 : 0, iteration: p ? p.loop - 1 : 0, finished: !!p };
@@ -742,8 +758,8 @@ function roomProgramProjection(view, targetLinear) {
   return { time: r.time, segIndex: r.segIndex, iteration: r.iteration, finished: r.finished };
 }
 
-// 当前按服务端锚点推算出的本地时码；到末尾自动停住（与服务端同规则）
-function roomCurrentTime(nowSec) {
+// 当前按服务端锚点 + 实际流逝推算出的本地时码；到末尾自动停住（与服务端同规则）
+function roomCurrentTime() {
   const r = state.room;
   const a = r.anchor;
   // 待生效定时启播：预约期间房间保持暂停在断点（本地不外推；轮询发现启播后锚点会更新）
@@ -751,7 +767,7 @@ function roomCurrentTime(nowSec) {
     return Math.min(a.time, r.view.duration);
   }
   if (!a.playing) return Math.min(a.time, r.view.duration);
-  let linear = a.time + Math.max(0, nowSec - a.wall) * a.speed;
+  const linear = a.time + roomElapsedSec() * a.speed;
   if (r.view.program && !r.view.program.finished) {
     // 循环排演：线性目标 -> 段/轮/时码映射
     const proj = roomProgramProjection(r.view, linear);
@@ -808,7 +824,7 @@ async function pollRoom() {
     renderRoomSchedule();
     updateRoomHandoverCountdown();
   } catch {
-    /* 单次轮询失败不打断观看：下一周期重试 */
+    /* 单次轮询失败不打断观看：按最近有效锚点继续外推展示，恢复后的下一次成功响应即重新校准 */
   }
 }
 
@@ -929,7 +945,7 @@ function leaveRoom() {
 function renderRoom() {
   const r = state.room;
   if (!r) return;
-  const t = roomCurrentTime(Date.now() / 1000);
+  const t = roomCurrentTime();
   $('room-time-current').textContent = fmt(t);
   $('room-timeline').value = String(t);
   $('room-revision-view').textContent = String(r.view.revision);
@@ -963,7 +979,7 @@ function renderRoomProgram() {
       renderProgramEditorRows();
     }
   }
-  updateRoomProgramStatus(roomCurrentTime(Date.now() / 1000));
+  updateRoomProgramStatus(roomCurrentTime());
 }
 
 // 重建编排编辑器表格（进入房间/增删段时调用；轮询不重建以免抢走输入焦点）
@@ -1357,10 +1373,10 @@ function renderRoomSchedule() {
 
   $('room-schedule-host').hidden = !isHost;
   $('room-schedule-viewer').hidden = isHost;
-  // 输入框未被编辑（未聚焦）时同步默认值（当前时间 + 5 分钟，取整到秒）
+  // 输入框未被编辑（未聚焦）时同步默认值（估算的服务端当前墙钟 + 5 分钟，取整到秒）
   const input = $('room-schedule-at');
   if (isHost && document.activeElement !== input) {
-    input.value = wallToLocalInput(Math.floor(Date.now() / 1000) + 300);
+    input.value = wallToLocalInput(Math.floor(roomServerNow()) + 300);
   }
   updateRoomScheduleCountdown();
 }
@@ -1372,7 +1388,8 @@ function updateRoomScheduleCountdown() {
   if (!r || !el) return;
   const sc = r.view.schedule;
   if (!sc || sc.state !== 'pending') return;
-  const remain = Math.max(0, sc.start_at - Date.now() / 1000);
+  // 剩余时间按估算的服务端墙钟推进：设备时钟偏差或调表都不会让倒计时失真
+  const remain = Math.max(0, sc.start_at - roomServerNow());
   const total = Math.ceil(remain);
   const hh = Math.floor(total / 3600);
   const mm = Math.floor((total % 3600) / 60);
@@ -1424,7 +1441,7 @@ $('btn-room-schedule-set').addEventListener('click', () => {
   const ms = new Date(raw).getTime();
   if (!Number.isFinite(ms)) return showErr($('room-schedule-error'), '启播时刻无效，请重新选择。');
   const sec = ms / 1000;
-  if (sec <= Date.now() / 1000) {
+  if (sec <= roomServerNow()) {
     return showErr($('room-schedule-error'), '启播时刻必须是未来时刻。');
   }
   submitRoomSchedule(sec);
@@ -1485,7 +1502,8 @@ async function issueRoomHandover() {
     });
     r.view = d;
     r.issuedToken = d.handover_token; // 仅本次显示，不写入 localStorage
-    r.issuedExpiresAt = Date.now() / 1000 + d.handover_expires_in;
+    // 到期时刻按服务端墙钟口径记录（响应的 server_wall + 有效期），倒计时随服务端进度推进
+    r.issuedExpiresAt = d.server_wall + d.handover_expires_in;
     r.issuedIssuedAt = d.handover && d.handover.issued_at ? d.handover.issued_at : null;
     applyRoomAnchor(d);
     renderRoomRole();
@@ -1664,7 +1682,8 @@ function renderRoomHandover() {
   }
 }
 
-// 倒计时：优先用本浏览器发起时的本地锚点，否则用 GET 的 expires_at - server_wall 估算
+// 倒计时：本浏览器发起的凭证与 GET 返回的 expires_at 同为服务端墙钟口径，
+// 统一减去估算的服务端当前墙钟（最近同步的 server_wall + 单调时钟实际流逝）
 function updateRoomHandoverCountdown() {
   const r = state.room;
   const el = document.getElementById(HANDOVER_COUNTDOWN_ID);
@@ -1674,10 +1693,9 @@ function updateRoomHandoverCountdown() {
   let remain;
   if (r.issuedToken && r.issuedExpiresAt && r.issuedIssuedAt !== null &&
       ho.issued_at && Math.abs(ho.issued_at - r.issuedIssuedAt) < 1) {
-    remain = Math.max(0, r.issuedExpiresAt - Date.now() / 1000);
+    remain = Math.max(0, r.issuedExpiresAt - roomServerNow());
   } else {
-    // expires_at 与 GET 的 server_wall 同为服务端墙钟，按本地墙钟差值显示即可
-    remain = Math.max(0, ho.expires_at - Date.now() / 1000);
+    remain = Math.max(0, ho.expires_at - roomServerNow());
   }
   const total = Math.ceil(remain);
   const mm = Math.floor(total / 60);
