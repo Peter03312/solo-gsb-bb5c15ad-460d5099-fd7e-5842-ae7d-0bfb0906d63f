@@ -573,8 +573,10 @@ function renderPlayer() {
 }
 
 /* ----------------------------- 共享房间 ----------------------------- */
-// 创建者持控制密钥，其他人凭房间码加入；观看端以服务端墙钟校时（基准时码 +
-// 流逝时间 × 速度），每秒轮询一次服务端状态做纠正，刷新/重连自动恢复。
+// 创建者持控制密钥，其他人凭房间码加入；观看端以服务端时码/墙钟为基准校时：
+// 两次同步之间只按本机单调时钟（performance.now）的实际流逝推进，不使用设备墙钟
+// 差值——设备时钟偏快/偏慢或观看途中被调整都不会让舞台跳到末尾或停在旧时码；
+// 每秒轮询一次服务端状态做重新锚定（纠正），刷新/重连自动恢复，轮询失败沿用旧锚点。
 
 const HASH_ROOM = 'room';
 const ROOM_KEY_STORE = 'cue-room-keys'; // { 房间码: 控制密钥 }，创建者刷新后仍可控制
@@ -594,7 +596,9 @@ function saveRoomKey(code, key) {
   localStorage.setItem(ROOM_KEY_STORE, JSON.stringify(store));
 }
 
-state.room = null; // { view, session, key, anchor:{wall,time,speed,playing}, pollTimer, rafId, progRows }
+state.room = null; // { view, session, key, clock, pollTimer, rafId, progRows }
+// clock：RoomClock 校时锚点（server_wall/server_time + 本机单调时刻），
+// 轮询暂时失败期间继续按最近一次有效锚点推进，恢复后重新校准。
 
 // 循环排演编辑器的段行（主持人本地草稿，未提交不影响房间）
 function defaultProgRow() {
@@ -670,14 +674,15 @@ async function enterRoom(code, key, initialView) {
   state.room = {
     view,
     key: key || loadRoomKeyStore()[view.code] || null,
-    // 本浏览器作为主持人发起交接后、仅本次显示的凭证与到期墙钟（不回显、不入存储）
+    // 本浏览器作为主持人发起交接后、仅本次显示的凭证与发起服务端墙钟（不回显、不入存储）
     issuedToken: null,
-    issuedExpiresAt: null,
     issuedIssuedAt: null,
     // 本浏览器领取交接后取得的新密钥提示（仅显示一次，可手动关闭）
     claimedKey: null,
     // 循环排演编辑器的本地段行草稿
     progRows: null,
+    // 校时锚点：以初始房间状态的服务端墙钟/时码为基准（本机单调时钟计时）
+    clock: window.RoomClock.createClock(),
     session: {
       id: snap.id,
       label: snap.label,
@@ -686,7 +691,7 @@ async function enterRoom(code, key, initialView) {
       duration: Engine.showDuration(cues),
     },
   };
-  applyRoomAnchor(view);
+  state.room.clock.sync(view);
 
   // 重置编排编辑器：进入新房间时强制按本房间草稿重建表格
   $('room-program-table').querySelector('tbody').dataset.rows = '';
@@ -713,18 +718,15 @@ async function enterRoom(code, key, initialView) {
   document.querySelector('.tab[data-tab="room"]').click();
 }
 
-// 服务端状态 -> 本地推算锚点（校时基准）
-function applyRoomAnchor(view) {
-  state.room.anchor = {
-    wall: view.server_wall,
-    time: view.server_time,
-    speed: view.speed,
-    playing: view.playing,
-  };
+// 服务端状态 -> 重新锚定校时基准（每次成功的轮询/控制/编排/交接响应后调用）。
+// 仅记录响应里的服务端墙钟/时码与此刻的本机单调时刻；两次同步之间按单调流逝推进，
+// 设备墙钟快慢或被调整都不影响推算。
+function syncRoomClock(view) {
+  state.room.clock.sync(view);
 }
 
 // 循环排演：把“线性目标时码”映射为编排中的真实演出时码（与服务端同一份纯函数）。
-// 观看端只拿到最近一次同步的段/轮/时码锚点；本地用墙钟外推。
+// 观看端只拿到最近一次同步的段/轮/时码锚点；两次同步之间按单调流逝外推。
 function roomProgramProjection(view, targetLinear) {
   const p = view.program;
   if (!p || p.finished) return { time: view.server_time, segIndex: p ? p.segment_index - 1 : 0, iteration: p ? p.loop - 1 : 0, finished: !!p };
@@ -742,16 +744,16 @@ function roomProgramProjection(view, targetLinear) {
   return { time: r.time, segIndex: r.segIndex, iteration: r.iteration, finished: r.finished };
 }
 
-// 当前按服务端锚点推算出的本地时码；到末尾自动停住（与服务端同规则）
-function roomCurrentTime(nowSec) {
+// 当前按服务端锚点推算出的本地时码；到末尾自动停住（与服务端同规则）。
+// 全程不读设备墙钟：流逝时间来自 RoomClock 的单调时钟，故设备时钟偏差/调整无影响。
+function roomCurrentTime() {
   const r = state.room;
-  const a = r.anchor;
   // 待生效定时启播：预约期间房间保持暂停在断点（本地不外推；轮询发现启播后锚点会更新）
   if (r.view.schedule && r.view.schedule.state === 'pending') {
-    return Math.min(a.time, r.view.duration);
+    return Math.min(r.clock.getAnchor().time, r.view.duration);
   }
-  if (!a.playing) return Math.min(a.time, r.view.duration);
-  let linear = a.time + Math.max(0, nowSec - a.wall) * a.speed;
+  const linear = r.clock.currentTime(); // 暂停锚点恒为基准时码；播放为基准 + 单调流逝 × 速度
+  if (!r.clock.isPlaying()) return Math.min(linear, r.view.duration);
   if (r.view.program && !r.view.program.finished) {
     // 循环排演：线性目标 -> 段/轮/时码映射
     const proj = roomProgramProjection(r.view, linear);
@@ -798,7 +800,7 @@ async function pollRoom() {
   try {
     const view = await api('GET', `/api/rooms/${encodeURIComponent(state.room.view.code)}`);
     state.room.view = view;
-    applyRoomAnchor(view);
+    syncRoomClock(view);
     $('room-speed').value = String(view.speed);
     renderRoomRole();
     renderRoomProtection();
@@ -808,7 +810,9 @@ async function pollRoom() {
     renderRoomSchedule();
     updateRoomHandoverCountdown();
   } catch {
-    /* 单次轮询失败不打断观看：下一周期重试 */
+    /* 单次轮询失败不打断观看：保留最近一次有效状态与校时锚点，RAF 循环按单调
+       流逝继续展示（播放/亮度/倒计时照常推进），下一周期重试；恢复后的响应
+       经 syncRoomClock 重新锚定，自动校准到服务端进度。 */
   }
 }
 
@@ -848,7 +852,7 @@ async function roomControl(action, extra = {}) {
       ...extra,
     });
     r.view = view;
-    applyRoomAnchor(view);
+    syncRoomClock(view);
     $('room-speed').value = String(view.speed);
     renderRoomRole();
     renderRoomProtection();
@@ -929,7 +933,7 @@ function leaveRoom() {
 function renderRoom() {
   const r = state.room;
   if (!r) return;
-  const t = roomCurrentTime(Date.now() / 1000);
+  const t = roomCurrentTime();
   $('room-time-current').textContent = fmt(t);
   $('room-timeline').value = String(t);
   $('room-revision-view').textContent = String(r.view.revision);
@@ -963,7 +967,7 @@ function renderRoomProgram() {
       renderProgramEditorRows();
     }
   }
-  updateRoomProgramStatus(roomCurrentTime(Date.now() / 1000));
+  updateRoomProgramStatus(roomCurrentTime());
 }
 
 // 重建编排编辑器表格（进入房间/增删段时调用；轮询不重建以免抢走输入焦点）
@@ -1085,7 +1089,7 @@ $('btn-room-prog-submit').addEventListener('click', async () => {
       segments,
     });
     r.view = view;
-    applyRoomAnchor(view);
+    syncRoomClock(view);
     renderRoomRole();
     renderRoomProtection();
     renderRoomHandover();
@@ -1120,7 +1124,7 @@ $('btn-room-prog-cancel').addEventListener('click', async () => {
       revision: r.view.revision,
     });
     r.view = view;
-    applyRoomAnchor(view);
+    syncRoomClock(view);
     renderRoomRole();
     renderRoomProtection();
     renderRoomHandover();
@@ -1256,7 +1260,7 @@ async function submitRoomStops(stops) {
       stops,
     });
     r.view = view;
-    applyRoomAnchor(view);
+    syncRoomClock(view);
     renderRoomRole();
     renderRoomProtection();
     renderRoomHandover();
@@ -1357,10 +1361,12 @@ function renderRoomSchedule() {
 
   $('room-schedule-host').hidden = !isHost;
   $('room-schedule-viewer').hidden = isHost;
-  // 输入框未被编辑（未聚焦）时同步默认值（当前时间 + 5 分钟，取整到秒）
+  // 输入框未被编辑（未聚焦）时同步默认值（按服务端墙钟估计的当前时刻 + 5 分钟，
+  // 取整到秒）：不用设备墙钟，设备时钟偏快/偏慢时预填的默认时刻也与服务端一致。
   const input = $('room-schedule-at');
   if (isHost && document.activeElement !== input) {
-    input.value = wallToLocalInput(Math.floor(Date.now() / 1000) + 300);
+    const serverNow = r.clock.serverWallNow() ?? Date.now() / 1000;
+    input.value = wallToLocalInput(Math.floor(serverNow) + 300);
   }
   updateRoomScheduleCountdown();
 }
@@ -1372,7 +1378,10 @@ function updateRoomScheduleCountdown() {
   if (!r || !el) return;
   const sc = r.view.schedule;
   if (!sc || sc.state !== 'pending') return;
-  const remain = Math.max(0, sc.start_at - Date.now() / 1000);
+  // 倒计时以服务端墙钟口径计算（预约时刻与 server_wall 同口径）：设备时钟快慢
+  // 或观看途中被调整都不影响剩余秒数；轮询失败时也按最近锚点的单调流逝继续走。
+  const serverNow = r.clock.serverWallNow();
+  const remain = Math.max(0, sc.start_at - (serverNow ?? Date.now() / 1000));
   const total = Math.ceil(remain);
   const hh = Math.floor(total / 3600);
   const mm = Math.floor((total % 3600) / 60);
@@ -1394,7 +1403,7 @@ async function submitRoomSchedule(startAtSec) {
       start_at: startAtSec,
     });
     r.view = view;
-    applyRoomAnchor(view);
+    syncRoomClock(view);
     renderRoomRole();
     renderRoomProtection();
     renderRoomHandover();
@@ -1424,7 +1433,9 @@ $('btn-room-schedule-set').addEventListener('click', () => {
   const ms = new Date(raw).getTime();
   if (!Number.isFinite(ms)) return showErr($('room-schedule-error'), '启播时刻无效，请重新选择。');
   const sec = ms / 1000;
-  if (sec <= Date.now() / 1000) {
+  // “必须是未来时刻”按服务端墙钟口径判定，避免设备时钟偏差导致误拒/误纳
+  const serverNow = r.clock.serverWallNow();
+  if (sec <= (serverNow ?? Date.now() / 1000)) {
     return showErr($('room-schedule-error'), '启播时刻必须是未来时刻。');
   }
   submitRoomSchedule(sec);
@@ -1444,7 +1455,7 @@ $('btn-room-schedule-cancel').addEventListener('click', async () => {
       revision: r.view.revision,
     });
     r.view = view;
-    applyRoomAnchor(view);
+    syncRoomClock(view);
     renderRoomRole();
     renderRoomProtection();
     renderRoomHandover();
@@ -1485,9 +1496,8 @@ async function issueRoomHandover() {
     });
     r.view = d;
     r.issuedToken = d.handover_token; // 仅本次显示，不写入 localStorage
-    r.issuedExpiresAt = Date.now() / 1000 + d.handover_expires_in;
     r.issuedIssuedAt = d.handover && d.handover.issued_at ? d.handover.issued_at : null;
-    applyRoomAnchor(d);
+    syncRoomClock(d);
     renderRoomRole();
     renderRoomHandover();
   } catch (err2) {
@@ -1521,10 +1531,9 @@ async function claimRoomHandover(token) {
     saveRoomKey(d.code, d.control_key);
     r.claimedKey = d.control_key;
     r.issuedToken = null;
-    r.issuedExpiresAt = null;
     r.issuedIssuedAt = null;
     r.view = d;
-    applyRoomAnchor(d);
+    syncRoomClock(d);
     $('room-key-input').value = d.control_key;
     renderRoomRole();
     renderRoomHandover();
@@ -1664,21 +1673,17 @@ function renderRoomHandover() {
   }
 }
 
-// 倒计时：优先用本浏览器发起时的本地锚点，否则用 GET 的 expires_at - server_wall 估算
+// 凭证倒计时：expires_at 与 server_wall 同为服务端墙钟口径，剩余秒数 =
+// expires_at − 服务端墙钟估计（按单调流逝推进）。无论凭证是不是本浏览器发起的、
+// 设备时钟偏差或观看途中被调整，倒计时都与服务端一致；轮询失败也按最近锚点继续走。
 function updateRoomHandoverCountdown() {
   const r = state.room;
   const el = document.getElementById(HANDOVER_COUNTDOWN_ID);
   if (!r || !el) return;
   const ho = r.view.handover;
   if (!ho || !ho.active) return;
-  let remain;
-  if (r.issuedToken && r.issuedExpiresAt && r.issuedIssuedAt !== null &&
-      ho.issued_at && Math.abs(ho.issued_at - r.issuedIssuedAt) < 1) {
-    remain = Math.max(0, r.issuedExpiresAt - Date.now() / 1000);
-  } else {
-    // expires_at 与 GET 的 server_wall 同为服务端墙钟，按本地墙钟差值显示即可
-    remain = Math.max(0, ho.expires_at - Date.now() / 1000);
-  }
+  const serverNow = r.clock.serverWallNow();
+  const remain = Math.max(0, ho.expires_at - (serverNow ?? Date.now() / 1000));
   const total = Math.ceil(remain);
   const mm = Math.floor(total / 60);
   const ss = String(total % 60).padStart(2, '0');
